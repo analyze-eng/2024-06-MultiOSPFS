@@ -1,0 +1,465 @@
+---
+title: "Simulate Multi-State"
+author: "analyze.eng@gmail.com"
+date: "2024-06-20"
+output: html_document
+---
+
+```{r setup, eval= TRUE, echo=FALSE}
+## Clear current session
+rm(list = ls(all.names=TRUE))
+
+## Free memory, force garbage collection
+invisible(gc())
+
+## Main Knitr options
+knitr::opts_chunk$set(echo = TRUE)
+
+## Default behavior: Suppress warnings
+knitr::opts_chunk$set(eval=TRUE,
+                      message=FALSE,warning=FALSE,
+                      comment.char=" ")                     
+
+## Print graphics after code chunk
+knitr::opts_chunk$set(fig.align="center",
+                      fig.show ="asis")
+
+## KHE standard sizing
+knitr::opts_chunk$set(fig.width=6,fig.height=4)
+```
+
+```{r more_setup, echo=FALSE}
+library(survival)
+library(muhaz)
+library(igraph)
+library(gss)
+
+## Set colors from Kevin's favorite subway lines
+subway<-c("#0039A6","#EE352E","#FCCC0A","#00933C",
+          "#FF6319","#B933AD","#00B2A9","#00A1DE")
+palette(subway)
+```
+
+# Context
+
+I am interested in the idea that we can find biomarkers of a particular type by studying the joint (OS, PFS) process.  A technical innovation is to consider the multi-state survival process of a particular topology.  
+
+```{r,fig.height=4,fig.width=4,echo=FALSE}
+library(igraph)
+el<-rbind(c("0:ANED","1:AWD"),
+          c("1:AWD","3:DEAD"),
+          c("0:ANED","3:DEAD"))
+xy<-rbind(c(-1,0),c(0,sqrt(3)),c(1,0))
+g<-graph_from_edgelist(el)
+V(g)$size<-80
+V(g)$frame.color<-NA
+V(g)$color<-NA
+V(g)$label.family<-"sans"
+V(g)$label.color<-"black"
+E(g)$arrow.size<-.5
+plot(g,layout=xy,asp=1)
+```
+
+My plan is to generate data following `coxph(OS~b1*X)` and `coxph(PFS~b2*X)` and then to estimate the component hazards.  I think that we will see a peculiar behavior as a function of covariates `(b1, b2)`.  
+
+Some questions about the censoring process are also relevant.  Consider the independent censoring time that may follow `coxph(CENS~b3*X)` and the implications for the component hazards.
+
+Analysis will follow https://cran.r-project.org/web/packages/survival/vignettes/compete.pdf
+
+# TCGA Data Analysis
+Data from TCGA-OV is available to show that this data structure exists in reality.
+
+## Load Data
+We are after the general `Surv(tstart,tstop,event)` data structure where `levels(event) = c("ANED","DEATH","PROGRESSION")`.  
+
+```{r}
+## Each row is a person
+x<-read.table(
+            file = "Data/data_clinical_patient.txt",
+            sep="\t",
+            skip=4,
+            row.names=1,
+            header=TRUE)
+
+## Convert to clear variables
+dat1<-x[,c("OS_STATUS","OS_MONTHS","PFS_STATUS","PFS_MONTHS")]
+dat1$time1<-dat1$OS_MONTHS
+dat1$event1<-dat1$OS_STATUS=="1:DECEASED"
+dat1$time2<-dat1$PFS_MONTHS
+dat1$event2<-dat1$PFS_STATUS=="1:PROGRESSION"
+
+## Drop bad records
+dat1<-dat1[which(!is.na(dat1$time1)),]
+
+## Construct the gap time
+dat1$gaptime<-dat1$time1-dat1$time2
+dat1$id<-rownames(dat1)
+
+## Logic
+## 1. if there is a gap time, then (0,time2,event="PROG")
+##       and we need (time2,time1,event=event1)
+## 2. if not then 
+##       we have just (0,time1,event=event1)
+gate<-interaction(ifelse(dat1$gaptime>0,"gap","nogap"),
+                  ifelse(dat1$event1,"died","alive"))
+table(gate,useNA="a")
+```
+
+## Examine the OS and PFS time structure
+```{r}
+km1<-survfit(Surv(time1,event1)~1,dat1)
+km2<-survfit(Surv(time2,event2)~1,dat1)
+mh1<-muhaz(dat1$time1,dat1$event1)
+mh2<-muhaz(dat1$time2,dat1$event2)
+ss1<-sshzd(Surv(time1,event1)~time1,data=dat1)
+ss2<-sshzd(Surv(time2,event2)~time2,data=dat1)
+tt<-seq(from=0,to=100,length=500)
+
+xlim<-c(0,100)
+
+par(mfrow=c(1,2))
+
+## KM Plots
+plot(km1,axes=FALSE,xlim=xlim,
+     xlab="Months from Surgery",
+     ylab="Survival Fraction")
+  axis(1);axis(2,at=(0:2)/2);box()
+plot(km2,axes=FALSE,xlim=xlim, col=2,
+     xlab="Months from Surgery",
+     ylab="Progression-Free Fraction")
+  axis(1);axis(2,at=(0:2)/2);box()
+
+## Muhaz plots are not worth showing
+#plot(mh1,ylab="Hazard of Death",xlim=xlim)
+#plot(mh2,ylab="Hazard of Death or Progression",xlim=xlim)
+```
+
+```{r}
+## SS plots
+h1<-hzdrate.sshzd(ss1,x=data.frame(time1=tt),se=TRUE)
+h1<-h1$fit*exp(cbind(0,-h1$se.fit,h1$se.fit)*1.96)
+h2<-hzdrate.sshzd(ss2,x=data.frame(time2=tt),se=TRUE)
+h2<-h2$fit*exp(cbind(0,-h2$se.fit,h2$se.fit)*1.96)
+
+matplot(tt,cbind(h1,h2),type="l",
+        ylim=c(0,.07),lty=c(1,2,2),
+        lwd=c(2,1,1),col=c(1,1,1,2,2,2),
+        xlab="Months from Surgery",
+        ylab="Hazard Rate",
+        sub="Smoothing Spline Estimate")
+legend("topright",text.col=2:1,
+       legend=c("Death or Progression (PFS)","Death (OS)"),bty="n")
+
+```
+
+Discuss limitations.  Hard to attribute hazard to one event or the other.  Why is Death hazard higher than the combination hazard after 45 months? Unintuitive: PFS-related events have taken many people out of consideration.  So people who die after progression aren't considered.  The difference might imply higher death after progression rates.
+
+
+## Build Event Process Data structure
+
+We can now start constructing the event-process data structure
+
+```{r}
+dat2<-split(dat1,f=gate)
+
+## Paste together the (tstart,tend,event)
+## Data structure using rules from above.
+dat3<-
+rbind(
+  data.frame(tstart=0,
+             tend=dat2[["nogap.alive"]][,c("time1")],
+             event="cens",
+             last="(s0)",
+             id=dat2[["nogap.alive"]][,"id"]),
+  data.frame(tstart=0,
+             tend=dat2[["nogap.died"]][,"time1"],
+             event="died",
+             last="(s0)",
+             id=dat2[["nogap.died"]][,"id"]),
+  
+  data.frame(tstart=0,
+             tend=dat2[["gap.died"]][,"time2"],
+             event="prog",
+             last="(s0)",
+             id=dat2[["gap.died"]][,"id"]),
+  data.frame(tstart=dat2[["gap.died"]][,"time2"],
+             tend=dat2[["gap.died"]][,"time1"],
+             event="died",
+             last="prog",
+             id=dat2[["gap.died"]][,"id"]),
+  
+  data.frame(tstart=0,
+             tend=dat2[["gap.alive"]][,"time2"],
+             event="prog",
+             last="(s0)",
+             id=dat2[["gap.alive"]][,"id"]),
+  data.frame(tstart=dat2[["gap.alive"]][,"time2"],
+             tend=dat2[["gap.alive"]][,"time1"],
+             event="cens",
+             last="prog",
+             id=dat2[["gap.alive"]][,"id"])
+)
+dat3$event<-factor(dat3$event,c("cens","prog","died"))
+```
+
+## Look at multistate data
+
+This data structure is amenable to multi-state regression analysis. Here are some of the usual operations. 
+
+```{r}
+library(survival)
+mfit1<-survfit(Surv(tstart, tend, event) ~ 1, data=dat3, id=id)
+print(mfit1,digits=3,rmean=180)
+
+mfit1$transitions
+
+plot(mfit1[,"prog"],xlab="Months After Surgery",
+     ylab="Fraction in State",col=1,ylim=c(0,1),
+     axes=FALSE)
+box();axis(1);axis(2,at=(0:2)/2)
+lines(mfit1[,"died"],col=2)
+lines(mfit1[,"(s0)"],col=3)
+legend("right",text.col=1:3,
+       legend=c("AWD","DEAD","ANED"),bty="n")
+```
+
+Okay this is a nice way to look at the data.
+
+## Consider hazards
+
+```{r}
+## Remember Chong Gu hardcoded a weird Surv(futime,status,start=0)
+ssA<-sshzd(Surv(tend,event=="prog",start=tstart) ~ tend, data=dat3,
+           subset=dat3$last=="(s0)")
+ssB<-sshzd(Surv(tend,event=="died",start=tstart) ~ tend, data=dat3,
+           subset=dat3$last=="prog")
+ssC<-sshzd(Surv(tend,event=="died",start=tstart) ~ tend, data=dat3,
+           subset=dat3$last=="(s0)")
+
+
+tt<-seq(from=0,to=100,length=500)
+
+hA<-hzdrate.sshzd(ssA,x=data.frame(tend=tt),se=TRUE)
+hA<-hA$fit*exp(cbind(0,-hA$se.fit,hA$se.fit)*1.96)
+hB<-hzdrate.sshzd(ssB,x=data.frame(tend=tt),se=TRUE)
+hB<-hB$fit*exp(cbind(0,-hB$se.fit,hB$se.fit)*1.96)
+hC<-hzdrate.sshzd(ssC,x=data.frame(tend=tt),se=TRUE)
+hC<-hC$fit*exp(cbind(0,-hC$se.fit,hC$se.fit)*1.96)
+```
+
+```{r}
+matplot(tt,cbind(hA,hB,hC),type="l",
+        ylim=c(0,.07),lty=c(1,2,2),
+        lwd=c(2,1,1),col=c(1,1,1,2,2,2,3,3,3)+3,
+        xlab="Months from Surgery",
+        ylab="Hazard Rate",
+        sub="Smoothing Spline Estimate",
+        main="Transition Hazards")
+legend("topright",text.col=4:6,
+       legend=c("ANED->AWD","AWD->Death","ANED->Death"),bty="n")
+```
+
+
+# RNA covariates
+
+Some processing for the RNA data file
+```{r}
+x<-read.table(
+            file = "Data/data_mrna_seq_v2_rsem.txt",
+            sep="\t",
+            header=TRUE,
+            colClasses = c("character",
+                           "character",
+                           rep("numeric",300)))
+x<-x[x[,1]!="",]     # Drop missing HUGO
+bar<-x[,1]  
+
+# Take sum over RSEM expected counts
+# this just piles different gene concepts 
+# into the same bin
+foo<-apply((x[,-(1:2)]),2,
+           function(a)tapply(a,bar,sum))
+colnames(foo)<-substr(gsub("\\.","-",colnames(foo)),1,12)
+
+## We'll analyze on log
+foo<-log(foo)        # some expected counts are <0
+foo[is.nan(foo)]<-NA # kill them
+
+sna<-apply(foo,1,var,na.rm=TRUE)
+foo<-foo[sna>0,] # Genes have to have some variation
+
+set<-intersect(rownames(dat1),colnames(foo))
+dat<-dat1[set,]
+rna<-foo[,set]
+
+## drop any with no counts and any with more than 10% missing
+rna<-rna[apply(is.na(rna),1,mean)<.1,]
+
+## Subset to 1000 most variable for illustration
+set<-names(rev(sort(apply(rna,1,var,na.rm=TRUE)))[1:1000])
+
+dim(rna)
+```
+
+## OS and PFS with univariate PH effects
+```{r}
+data1<-dat1[colnames(rna),]
+
+## Just do one per
+p1<-apply(rna[set,],1,
+          function(x)summary(coxph(Surv(time1,event1)~scale(x),data1))$coef[1,])
+p2<-apply(rna[set,],1,
+          function(x)summary(coxph(Surv(time2,event2)~scale(x),data1))$coef[1,])
+p3<-1-(1-pmin(p1[5,],p2[5,]))^2
+cc<-rev(colorRampPalette(c("grey","darkred"))(50))
+c3<-as.numeric(cut(p3,breaks=c(seq(from=0,to=.05,length=50),1)))
+c3<-cc[c3]
+
+par(mfrow=c(1,2))
+plot(p1[1,],p2[1,],col=c3,pch=19,cex=.5)
+plot(-log10(p1[5,]),-log10(p2[5,]),col=c3,pch=19,cex=.5)
+```
+
+## OS and PFS with time-varying, non-PH effects
+```{r}
+## "ADAM6" has an okay pattern
+## "AMPD1" simliar
+gene<-rna["IGJ",]
+df1<-data1;df1$time<-df1$time1;df1$x<-as.numeric(scale(gene))
+ss1<-sshzd(Surv(time,event1)~time*x,
+           data=df1,seed=609)
+df2<-df1;df2$time<-df2$time2
+ss2<-sshzd(Surv(time,event2)~time*x,
+           data=df2,seed=609)
+
+```
+
+```{r}
+## make 2 plots
+nx<-40;nt<-50
+ranx<-range(scale(gene),na.rm=TRUE)
+grid.x<-seq(from=ranx[1],to=ranx[2],length=nx)
+grid.t<-seq(from=0,to=100,length=nt)
+xy<-expand.grid(time=grid.t,x=grid.x)
+
+mm<-lapply(list(ss1,ss2),hzdrate.sshzd,x=xy)
+mm<-lapply(mm,matrix,ncol=nx,nrow=nt) 
+mm<-lapply(mm,log)
+
+lab<-c("Hazard of Death","Hazard for Death/Progression")
+zlim<-range(unlist(mm),na.rm=TRUE)
+col<-c(hcl.colors(50),colorRampPalette(c(hcl.colors(2)[2],"red"))(50))
+par(mfrow=c(1,2))
+for(k in 1:2){
+  image(grid.t,grid.x,mm[[k]],main=lab[k],col=col,
+        zlim=zlim,
+        xlab="Months from Surgery",
+        ylab="Baseline Expression")
+  contour(grid.t,grid.x,mm[[k]],add=TRUE)
+}
+
+
+```
+
+## multi-state with univariate effects
+```{r}
+mm<-match(dat3$id,colnames(rna))
+pA<-apply(rna[set,mm],1,function(x){
+   df<-na.omit(data.frame(dat3,x=scale(x)))
+   ph<-coxph(Surv(tstart,tend,event=="prog")~x,
+             data=df,subset=df$last=="(s0)")
+   summary(ph)$coef[1,]
+})
+pB<-apply(rna[set,mm],1,function(x){
+   df<-na.omit(data.frame(dat3,x=scale(x)))
+   ph<-coxph(Surv(tstart,tend,event=="died")~x,
+             data=df,subset=df$last=="prog")
+   summary(ph)$coef[1,]
+})
+pC<-apply(rna[set,mm],1,function(x){
+   df<-na.omit(data.frame(dat3,x=scale(x)))
+   ph<-coxph(Surv(tstart,tend,event=="died")~x,
+             data=df,subset=df$last=="(s0)")
+   summary(ph)$coef[1,]
+})
+
+bb<-cbind(c(pA[1,]),c(pB[1,]),c(pC[1,]))
+
+library(umap)
+Y<-umap(bb)
+km<-kmeans(bb,5)
+plot(Y$layout,col=km$cluster)
+
+## Pick out an egregious one
+#head(rev(sort((pA[1,]-pB[1,])^2)))
+## C7orf52, ATP1A2, NAA11, KRT83, RD3, PRSS33
+hit<-c("C7orf52","ATP1A2",             # pB specific
+       "NAA11","KRT83","RD3","PRSS33") # pA specific
+pA[c(1,5),hit]
+pB[c(1,5),hit]
+```
+
+
+## Time-varying, non-PH models
+```{r, searchtvnph, fig.height=4}
+## set up RNA alignment, I don't feel like copying 
+## a big rna data frame around, so I call it 
+## when I need it
+mat<-match(dat3$id,colnames(rna))
+
+## Pick NAA11; has interesting 1st plot
+## Pick ATP1A2; has interesting last plot
+## SAA1: Good baseline. Shows progression specific
+## PI3, interesting first and last, but not enough gradient
+
+hitlist<-c("NAA11","ATP1A2","SAA1","PI3")
+lab<-c("ANED->AWD","AWD->DEAD","ANED->DEAD")
+col<-c(hcl.colors(50),colorRampPalette(c(hcl.colors(2)[2],"red"))(50))
+
+
+for(gen in hitlist){
+  gene<-rna[gen,mat]
+  df  <-na.omit(data.frame(dat3,x=scale(gene))) # much smaller
+  
+  ssA<-sshzd(Surv(tend,event=="prog", start=tstart)~tend*x,
+             data=df,subset=df$last=="(s0)",
+             seed=609)
+  ssC<-sshzd(Surv(tend,event=="died", start=tstart)~tend*x,
+             data=df,subset=df$last=="prog",
+             seed=609)
+  ssC<-sshzd(Surv(tend,event=="died", start=tstart)~tend*x,
+             data=df,subset=df$last=="(s0)",
+             seed=609)
+  
+  ## make 3 plots
+  nx<-40;nt<-50
+  ranx<-range(scale(gene),na.rm=TRUE)
+  grid.x<-seq(from=ranx[1],to=ranx[2],length=nx)
+  grid.t<-seq(from=0,to=100,length=nt)
+  xy<-expand.grid(tend=grid.t,x=grid.x)
+  
+  mm<-lapply(list(ssA,ssB,ssC),hzdrate.sshzd,x=xy)
+  mm<-lapply(mm,matrix,ncol=nx,nrow=nt) 
+  
+  zlim<-range(unlist(mm),na.rm=TRUE)
+  par(mfrow=c(1,3))
+  for(k in 1:3){
+    image(grid.t,grid.x,mm[[k]],main=lab[k],col=col,
+          zlim=zlim,
+          xlab="Months from Surgery",
+          ylab=gen)
+    contour(grid.t,grid.x,mm[[k]],add=TRUE)
+  }
+  
+  mm<-lapply(mm,log)
+  zlim<-range(unlist(mm),na.rm=TRUE)
+  par(mfrow=c(1,3))
+  for(k in 1:3){
+    image(grid.t,grid.x,mm[[k]],main=lab[k],col=col,
+          zlim=zlim,
+          xlab="Months from Surgery",
+          ylab=gen)
+    contour(grid.t,grid.x,mm[[k]],add=TRUE)
+  }
+}
+```

@@ -1,0 +1,194 @@
+---
+title: "Simulate Multi-State"
+author: "analyze.eng@gmail.com"
+date: "2024-06-20"
+output: html_document
+---
+
+```{r setup, eval= TRUE, echo=FALSE}
+## Clear current session
+rm(list = ls(all.names=TRUE))
+
+## Free memory, force garbage collection
+invisible(gc())
+
+## Main Knitr options
+knitr::opts_chunk$set(echo = TRUE)
+
+## Default behavior: Suppress warnings
+knitr::opts_chunk$set(eval=TRUE,
+                      message=FALSE,warning=FALSE,
+                      comment.char=" ")                     
+
+## Print graphics after code chunk
+knitr::opts_chunk$set(fig.align="center",
+                      fig.show ="asis")
+
+## KHE standard sizing
+knitr::opts_chunk$set(fig.width=12,fig.height=6)
+```
+
+```{r more_setup}
+library(survival)
+library(gss)
+library(muhaz)
+library(umap)
+
+## Set colors from Kevin's favorite subway lines
+subway<-c("#0039A6","#EE352E","#FCCC0A","#00933C",
+          "#FF6319","#B933AD","#00B2A9","#00A1DE")
+palette(subway)
+```
+
+# Context
+
+I am interested in the idea that we can find biomarkers of a particular type by studying the joint (OS, PFS) process.  A technical innovation is to consider the multi-state survival process of a particular topology.  
+
+My plan is to generate data following `coxph(OS~b1*X)` and `coxph(PFS~b2*X)` and then to estimate the component hazards.  I think that we will see a peculiar behavior as a function of covariates `(b1, b2)`.  
+
+Some questions about the censoring process are also relevant.  Consider the independent censoring time that may follow `coxph(CENS~b3*X)` and the implications for the component hazards.
+
+Analysis will follow https://cran.r-project.org/web/packages/survival/vignettes/compete.pdf
+
+# TCGA Data Analysis
+Data from TCGA-OV is available to show that this data structure exists in reality.  
+
+
+## Load Data
+We are after the general `Surv(tstart,tstop,event)` data structure where `levels(event) = c("ANED","DEATH","PROGRESSION")`.  
+
+```{r}
+## Each row is a person
+x<-read.table(
+            file = "Data/data_clinical_patient.txt",
+            sep="\t",
+            skip=4,
+            row.names=1,
+            header=TRUE)
+
+## Convert to clear variables
+dat1<-x[,c("OS_STATUS","OS_MONTHS","PFS_STATUS","PFS_MONTHS")]
+dat1$time1<-dat1$OS_MONTHS
+dat1$event1<-dat1$OS_STATUS=="1:DECEASED"
+dat1$time2<-dat1$PFS_MONTHS
+dat1$event2<-dat1$PFS_STATUS=="1:PROGRESSION"
+
+## Drop bad records
+dat1<-dat1[which(!is.na(dat1$time1)),]
+
+## Construct the gap time
+dat1$gaptime<-dat1$time1-dat1$time2
+dat1$id<-rownames(dat1)
+
+## Logic
+## 1. if there is a gap time, then (0,time2,event="PROG")
+##       and we need (time2,time1,event=event1)
+## 2. if not then 
+##       we have just (0,time1,event=event1)
+gate<-interaction(ifelse(dat1$gaptime>0,"gap","nogap"),
+                  ifelse(dat1$event1,"died","alive"))
+table(gate,useNA="a")
+
+```
+
+We can now start constructing the event-process data structure
+
+```{r}
+dat2<-split(dat1,f=gate)
+
+## Paste together the (tstart,tend,event)
+## Data structure using rules from above.
+dat3<-
+rbind(
+  data.frame(tstart=0,
+             tend=dat2[["nogap.alive"]][,c("time1")],
+             event="cens",
+             id=dat2[["nogap.alive"]][,"id"]),
+  data.frame(tstart=0,
+             tend=dat2[["nogap.died"]][,"time1"],
+             event="died",
+             id=dat2[["nogap.died"]][,"id"]),
+  
+  data.frame(tstart=0,
+             tend=dat2[["gap.died"]][,"time2"],
+             event="prog",
+             id=dat2[["gap.died"]][,"id"]),
+  data.frame(tstart=dat2[["gap.died"]][,"time2"],
+             tend=dat2[["gap.died"]][,"time1"],
+             event="died",
+             id=dat2[["gap.died"]][,"id"]),
+  
+  data.frame(tstart=0,
+             tend=dat2[["gap.alive"]][,"time2"],
+             event="prog",
+             id=dat2[["gap.alive"]][,"id"]),
+  data.frame(tstart=dat2[["gap.alive"]][,"time2"],
+             tend=dat2[["gap.alive"]][,"time1"],
+             event="cens",
+             id=dat2[["gap.alive"]][,"id"])
+)
+dat3$event<-factor(dat3$event,c("cens","prog","died"))
+```
+
+## Look at multistate data
+
+This data structure is amenable to multi-state regression analysis. Here are some of the usual operations. 
+
+```{r}
+library(survival)
+mfit1<-survfit(Surv(tstart, tend, event) ~ 1, data=dat3, id=id)
+print(mfit1,digits=3,rmean=180)
+
+mfit1$transitions
+
+plot(mfit1[,"prog"],xlab="Months After Surgery",
+     ylab="Fraction in State",col=1,ylim=c(0,1))
+lines(mfit1[,"died"],col=2)
+lines(mfit1[,"(s0)"],col=3)
+legend("right",text.col=1:3,
+       legend=c("Progressed","Dead","ANED"),bty="n")
+```
+
+Okay this is a nice way to look at the data.
+
+We should start putting covariates into the problem.
+
+## TCGA covariates
+
+```{r}
+x<-read.table(
+            file = "Data/data_mrna_seq_v2_rsem.txt",
+            sep="\t",
+            header=TRUE,
+            colClasses = c("character",
+                           "character",
+                           rep("numeric",300)))
+x<-x[x[,1]!="",]     # Drop missing HUGO
+bar<-x[,1]  
+
+# Take sum over RSEM expected counts
+# this just piles different gene concepts 
+# into the same bin
+foo<-apply((x[,-(1:2)]),2,
+           function(a)tapply(a,bar,sum))
+colnames(foo)<-substr(gsub("\\.","-",colnames(foo)),1,12)
+
+## We'll analyze on log
+foo<-log(foo)        # some expected counts are <0
+foo[is.nan(foo)]<-NA # kill them
+
+sna<-apply(foo,1,var,na.rm=TRUE)
+foo<-foo[sna>0,] # Genes have to have some variation
+
+set<-intersect(rownames(dat1),colnames(foo))
+dat<-dat1[set,]
+rna<-foo[,set]
+
+## drop any with no counts
+rna<-rna[!apply(is.na(rna),1,all),]
+
+```
+
+Establish what b1 and b2 are for OS and PFS.
+
+Then establish what they look like for each of the processes.
